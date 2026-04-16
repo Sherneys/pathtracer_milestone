@@ -1,0 +1,3 @@
+/Users/viritphonchongpermwattanapol/Desktop/Chula/Project/RayTracingMilestone/build/CMakeFiles/pathtracer.dir
+/Users/viritphonchongpermwattanapol/Desktop/Chula/Project/RayTracingMilestone/build/CMakeFiles/edit_cache.dir
+/Users/viritphonchongpermwattanapol/Desktop/Chula/Project/RayTracingMilestone/build/CMakeFiles/rebuild_cache.dir
