@@ -14,7 +14,6 @@ class material {
         return color(0,0,0);
     }
 
-    // เพิ่ม const point_light& light เข้ามาใน signature
     virtual bool scatter(
         const ray& r_in, const hit_record& rec, const hittable& world, 
         const point_light& light, color& direct_light, color& attenuation, ray& scattered
@@ -50,22 +49,23 @@ class lambertian : public material {
         // ==========================================
         // STRATEGY 1: DIRECT LIGHT SAMPLING (MIS)
         // ==========================================
-        vec3 to_light = light.position - rec.p; // ใช้ light ที่รับเข้ามา
+        vec3 to_light = light.position - rec.p;
         double dist_to_light_sq = to_light.length_squared();
         vec3 light_dir = unit_vector(to_light);
 
         if (dot(rec.normal, light_dir) > 0) {
             ray shadow_ray(offset_p, light_dir);
             hit_record shadow_rec;
-            
-            if (!world.hit(shadow_ray, interval(0.001, sqrt(dist_to_light_sq)), shadow_rec)) {
-                double p_light = dist_to_light_sq; 
-                double p_bsdf_for_light = scattering_pdf(rec, light_dir);
-                double w_light = power_heuristic(p_light, p_bsdf_for_light);
-                
+
+            double dist_to_light = std::sqrt(dist_to_light_sq);
+            if (!world.hit(shadow_ray, interval(0.001, dist_to_light - 1e-4), shadow_rec)) {
+                // Point light is a delta distribution — BSDF sampling can never
+                // hit it, so MIS weight for the light-sampling strategy is 1.
+                double w_light = 1.0;
+
                 color f_r = albedo / M_PI;
-                // ใช้ light.intensity ตาม Case นั้นๆ
-                direct_light = w_light * f_r * light.intensity; //* dot(rec.normal, light_dir) / p_light;
+                direct_light = w_light * f_r * light.intensity
+                             * dot(rec.normal, light_dir) / dist_to_light_sq;
             }
         }
 
@@ -78,17 +78,17 @@ class lambertian : public material {
         }
 
         scattered = ray(offset_p, unit_vector(scatter_direction));
-        
-        double p_bsdf = scattering_pdf(rec, scattered.direction());
-        double p_light_for_bsdf = 0.0; 
-        double w_bsdf = power_heuristic(p_bsdf, p_light_for_bsdf);
 
-        attenuation = w_bsdf * albedo;
+        // BSDF-strategy MIS weight: p_light_for_bsdf = 0 because BSDF sampling
+        // cannot hit a delta point light, so w_bsdf = 1. Attenuation for
+        // cosine-weighted hemisphere sampling simplifies to albedo:
+        //   f_r * cosθ / pdf  =  (albedo/π) * cosθ / (cosθ/π)  =  albedo
+        attenuation = albedo;
         return true;
     }
 };
 
-// --- 3. Dielectric (ต้องแก้ signature ตาม base class ด้วย) ---
+// --- 3. Dielectric
 class dielectric : public material {
   public:
     double ir;
@@ -102,29 +102,43 @@ class dielectric : public material {
     }
 
     bool scatter(
-        const ray& r_in, const hit_record& rec, const hittable& world, 
+        const ray& r_in, const hit_record& rec, const hittable& world,
         const point_light& light, color& direct_light, color& attenuation, ray& scattered
     ) const override {
-        
-        direct_light = color(0,0,0); // Dielectric เป็นกระจก ไม่รับ Direct Light ตรงๆ
-        attenuation = color(1.0, 1.0, 1.0);
-        
+
+        // Dielectric is a delta BSDF. MIS with a delta point light is
+        // degenerate on both strategies, so the direct-light contribution is 0.
+        // The light is gathered when the refracted/reflected path eventually
+        // lands on a diffuse surface.
+        direct_light = color(0,0,0);
+        attenuation  = color(1.0, 1.0, 1.0);
+
+        // ==========================================
+        // SPECULAR / REFRACTIVE SCATTERING
+        // ==========================================
         double refraction_ratio = rec.front_face ? (1.0 / ir) : ir;
         vec3 unit_direction = unit_vector(r_in.direction());
-        
+
         double cos_theta = std::fmin(dot(-unit_direction, rec.normal), 1.0);
         double sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
 
+        // Total internal reflection condition (sin²θ_t > 1):
         bool cannot_refract = refraction_ratio * sin_theta > 1.0;
         vec3 direction;
 
-        if (cannot_refract || reflectance(cos_theta, refraction_ratio) > random_double()) {
+        if (cannot_refract) {
+            // Pure TIR — do not attempt to compute a refraction direction.
+            direction = reflect(unit_direction, rec.normal);
+        } else if (reflectance(cos_theta, refraction_ratio) > random_double()) {
             direction = reflect(unit_direction, rec.normal);
         } else {
             direction = refract(unit_direction, rec.normal, refraction_ratio);
         }
 
-        scattered = ray(rec.p + rec.normal * 1e-4, direction);
+        // Offset along the geometric normal in the direction of travel to avoid
+        // self-intersection (ε = 1e-4 per spec §4.1).
+        vec3 offset_normal = dot(direction, rec.normal) > 0 ? rec.normal : -rec.normal;
+        scattered = ray(rec.p + offset_normal * 1e-4, direction);
         return true;
     }
 };

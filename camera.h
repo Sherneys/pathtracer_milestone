@@ -147,33 +147,33 @@ class camera {
 
             ray scattered;
             color attenuation;
-            color direct_light(0,0,0); // NEW: A container for MIS direct light
+            color direct_light(0,0,0);
             color color_from_emission = rec.mat->emitted(rec.u, rec.v, rec.p);
 
             if (!rec.mat->scatter(r, rec, world, light, direct_light, attenuation, scattered))
                 return color_from_emission;
             
             // ==========================================
-            // RUSSIAN ROULETTE IMPLEMENTATION
+            // RUSSIAN ROULETTE IMPLEMENTATION (UNBIASED)
             // ==========================================
-
-            // Trigger only after the first bounce
+            // Trigger only after the first bounce.
+            // Surviving paths must compensate by 1/rr_prob to stay unbiased.
+            double rr_factor = 1.0;
             if (depth < max_depth) {
-                // Roll the dice to see if the ray terminates early
                 if (random_double() > rr_prob) {
                     // Path is terminated. Return only what we've gathered so far.
-                    return color_from_emission + direct_light; 
+                    return color_from_emission + direct_light;
                 }
+                rr_factor = 1.0 / rr_prob;
             }
 
             // ==========================================
             // INDIRECT LIGHT (Surviving Paths Only)
             // ==========================================
-            
             color color_from_scatter = attenuation * ray_color(scattered, depth-1, world, light);
 
-            // NEW: Add the direct light to the final return
-            return color_from_emission + direct_light + color_from_scatter;
+            // Add direct light + (compensated) indirect
+            return color_from_emission + direct_light + rr_factor * color_from_scatter;
         }
 };
 
