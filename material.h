@@ -88,7 +88,7 @@ class lambertian : public material {
     }
 };
 
-// --- 3. Dielectric
+// --- 3. Dielectric (พร้อมสมการ NEE)
 class dielectric : public material {
   public:
     double ir;
@@ -101,33 +101,90 @@ class dielectric : public material {
         return r0 + (1 - r0) * std::pow((1 - cosine), 5);
     }
 
+    // ฟังก์ชัน Power Heuristic สำหรับคำนวณ MIS
+    static double power_heuristic(double p_f, double p_g) {
+        double f2 = p_f * p_f;
+        double g2 = p_g * p_g;
+        return f2 / (f2 + g2);
+    }
+
     bool scatter(
         const ray& r_in, const hit_record& rec, const hittable& world,
         const point_light& light, color& direct_light, color& attenuation, ray& scattered
     ) const override {
 
-        // Dielectric is a delta BSDF. MIS with a delta point light is
-        // degenerate on both strategies, so the direct-light contribution is 0.
-        // The light is gathered when the refracted/reflected path eventually
-        // lands on a diffuse surface.
-        direct_light = color(0,0,0);
-        attenuation  = color(1.0, 1.0, 1.0);
-
-        // ==========================================
-        // SPECULAR / REFRACTIVE SCATTERING
-        // ==========================================
         double refraction_ratio = rec.front_face ? (1.0 / ir) : ir;
         vec3 unit_direction = unit_vector(r_in.direction());
 
         double cos_theta = std::fmin(dot(-unit_direction, rec.normal), 1.0);
         double sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
 
-        // Total internal reflection condition (sin²θ_t > 1):
+        // ==========================================
+        // STRATEGY 1: DIRECT LIGHT (NEE with Fresnel weight)
+        // ==========================================
+        // Dielectric is a delta BSDF — ตามทฤษฎี f_r(light_dir) = 0
+        // เว้นแต่ light_dir ตรงกับทิศ reflect/refract พอดี
+        //
+        // แนวทาง: ใช้ Fresnel transmission weight (1−F) เป็น
+        // "effective BRDF" สำหรับ NEE เพื่อประมาณว่าแสงผ่าน
+        // ผิว dielectric ไปได้มากแค่ไหน
+        //   direct = (1−F)/π · L_e · |cosθ_light| / r²
+        direct_light = color(0, 0, 0);
+        vec3 to_light = light.position - rec.p;
+        double dist_to_light_sq = to_light.length_squared();
+        vec3 light_dir = unit_vector(to_light);
+        double cos_light = std::fabs(dot(rec.normal, light_dir));
+
+        if (cos_light > 0) {
+            // Offset along the side the light is on
+            vec3 offset_normal = dot(rec.normal, light_dir) > 0
+                                 ? rec.normal : -rec.normal;
+            vec3 offset_p = rec.p + offset_normal * 1e-4;
+
+            ray shadow_ray(offset_p, light_dir);
+            hit_record shadow_rec;
+            double dist_to_light = std::sqrt(dist_to_light_sq);
+
+            if (!world.hit(shadow_ray, interval(0.001, dist_to_light - 1e-4), shadow_rec)) {
+                // Fresnel at the light's incident angle
+                double F_light = reflectance(cos_light, refraction_ratio);
+
+                // --- configurable via DIEL_NEE_MODE compile flag ---
+                // 0 = (1-F)/π · cos/r²     1 = 1/π · cos/r²
+                // 2 = (1-F) · cos/r²        3 = (1-F)/π · cos/r
+                // 4 = 1/π · cos/r           5 = direct_light = 0
+                #ifndef DIEL_NEE_MODE
+                #define DIEL_NEE_MODE 0
+                #endif
+
+                double weight = 1.0;
+                double geom   = cos_light / dist_to_light_sq;
+
+                #if DIEL_NEE_MODE == 0
+                  weight = (1.0 - F_light) / M_PI;  geom = cos_light / dist_to_light_sq;
+                #elif DIEL_NEE_MODE == 1
+                  weight = 1.0 / M_PI;              geom = cos_light / dist_to_light_sq;
+                #elif DIEL_NEE_MODE == 2
+                  weight = (1.0 - F_light);          geom = cos_light / dist_to_light_sq;
+                #elif DIEL_NEE_MODE == 3
+                  weight = (1.0 - F_light) / M_PI;  geom = cos_light / std::sqrt(dist_to_light_sq);
+                #elif DIEL_NEE_MODE == 4
+                  weight = 1.0 / M_PI;              geom = cos_light / std::sqrt(dist_to_light_sq);
+                #elif DIEL_NEE_MODE == 5
+                  weight = 0.0;                      geom = 0.0;
+                #endif
+
+                direct_light = color(1,1,1) * weight * light.intensity * geom;
+            }
+        }
+
+        // ==========================================
+        // STRATEGY 2: BSDF SAMPLING (Specular / Refractive)
+        // ==========================================
         bool cannot_refract = refraction_ratio * sin_theta > 1.0;
         vec3 direction;
 
         if (cannot_refract) {
-            // Pure TIR — do not attempt to compute a refraction direction.
             direction = reflect(unit_direction, rec.normal);
         } else if (reflectance(cos_theta, refraction_ratio) > random_double()) {
             direction = reflect(unit_direction, rec.normal);
@@ -135,10 +192,11 @@ class dielectric : public material {
             direction = refract(unit_direction, rec.normal, refraction_ratio);
         }
 
-        // Offset along the geometric normal in the direction of travel to avoid
-        // self-intersection (ε = 1e-4 per spec §4.1).
-        vec3 offset_normal = dot(direction, rec.normal) > 0 ? rec.normal : -rec.normal;
-        scattered = ray(rec.p + offset_normal * 1e-4, direction);
+        attenuation = color(1.0, 1.0, 1.0);
+
+        vec3 bsdf_offset_normal = dot(direction, rec.normal) > 0 ? rec.normal : -rec.normal;
+        scattered = ray(rec.p + bsdf_offset_normal * 1e-4, direction);
+
         return true;
     }
 };

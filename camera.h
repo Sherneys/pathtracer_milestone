@@ -25,6 +25,13 @@ class camera {
         double focus_dist = 10; // Distance from camera lookfrom point to plane of perfect focus
 
         void render_test_case(const ray& primary_ray, const hittable& world, const point_light& light) const {
+            // Per spec §2.1 / §7: reproducible output requires a fixed mt19937
+            // seed. Scene construction (e.g. bvh_node) may or may not consume
+            // random numbers, so we reseed *here*, right before the Monte
+            // Carlo loop, to make the render independent of any RNG consumption
+            // that happened during scene setup.
+            get_rng().seed(12345);
+
             color total_radiance(0, 0, 0);
 
             for (int s = 0; s < samples_per_pixel; ++s) {
@@ -156,10 +163,16 @@ class camera {
             // ==========================================
             // RUSSIAN ROULETTE IMPLEMENTATION (UNBIASED)
             // ==========================================
-            // Trigger only after the first bounce.
-            // Surviving paths must compensate by 1/rr_prob to stay unbiased.
+            // Spec §6: "After the first bounce (depth ≥ 1), the path is
+            // terminated stochastically." The initial call uses depth =
+            // max_depth (primary ray → no RR). The first recursive call uses
+            // depth = max_depth - 1, which represents the *first* scattered
+            // bounce — this must also pass through unconditionally. RR only
+            // begins from the second indirect bounce onwards, i.e. when
+            // depth < max_depth - 1. Surviving paths compensate by 1/rr_prob
+            // so the estimator remains unbiased.
             double rr_factor = 1.0;
-            if (depth < max_depth) {
+            if (depth < max_depth - 1) {
                 if (random_double() > rr_prob) {
                     // Path is terminated. Return only what we've gathered so far.
                     return color_from_emission + direct_light;
