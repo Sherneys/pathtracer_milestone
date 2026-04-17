@@ -63,7 +63,7 @@ class lambertian : public material {
                 // hit it, so MIS weight for the light-sampling strategy is 1.
                 double w_light = 1.0;
 
-                color f_r = albedo / M_PI;
+                color f_r = albedo;
                 direct_light = w_light * f_r * light.intensity
                              * dot(rec.normal, light_dir) / dist_to_light_sq;
             }
