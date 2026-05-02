@@ -143,8 +143,8 @@ class camera {
             return center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
         }
 
-        color ray_color(const ray& r, int depth, const hittable& world, const point_light& light) const {
-            // If we've exceeded the ray bounce limit, no more light is gathered.
+        color ray_color(const ray& r, int depth, const hittable& world, const point_light& light,
+                        bool last_was_specular = true) const {
             if (depth <= 0)
                 return color(0,0,0);
 
@@ -152,40 +152,39 @@ class camera {
             if (!world.hit(r, interval(0.001, infinity), rec))
                 return background;
 
+            color color_from_emission = rec.mat->emitted(rec.u, rec.v, rec.p);
+            bool hit_emissive = (color_from_emission.x() + color_from_emission.y()
+                               + color_from_emission.z()) > 0.0;
+
+            // If a non-specular bounce produced this ray, NEE at the previous
+            // hit already accounted for direct illumination from the light, so
+            // counting the emission here too would double-count. Specular and
+            // primary bounces don't run NEE for this surface, so they keep the
+            // full emission.
+            if (hit_emissive) {
+                return last_was_specular ? color_from_emission : color(0,0,0);
+            }
+
             ray scattered;
             color attenuation;
             color direct_light(0,0,0);
-            color color_from_emission = rec.mat->emitted(rec.u, rec.v, rec.p);
 
             if (!rec.mat->scatter(r, rec, world, light, direct_light, attenuation, scattered))
                 return color_from_emission;
-            
-            // ==========================================
-            // RUSSIAN ROULETTE IMPLEMENTATION (UNBIASED)
-            // ==========================================
-            // Spec §6: "After the first bounce (depth ≥ 1), the path is
-            // terminated stochastically." The initial call uses depth =
-            // max_depth (primary ray → no RR). The first recursive call uses
-            // depth = max_depth - 1, which represents the *first* scattered
-            // bounce — this must also pass through unconditionally. RR only
-            // begins from the second indirect bounce onwards, i.e. when
-            // depth < max_depth - 1. Surviving paths compensate by 1/rr_prob
-            // so the estimator remains unbiased.
+
+            // Russian roulette (spec §6): RR applies once we are past the
+            // primary ray (path depth ≥ 1).
             double rr_factor = 1.0;
-            if (depth < max_depth - 1) {
+            if (depth < max_depth) {
                 if (random_double() > rr_prob) {
-                    // Path is terminated. Return only what we've gathered so far.
                     return color_from_emission + direct_light;
                 }
                 rr_factor = 1.0 / rr_prob;
             }
 
-            // ==========================================
-            // INDIRECT LIGHT (Surviving Paths Only)
-            // ==========================================
-            color color_from_scatter = attenuation * ray_color(scattered, depth-1, world, light);
+            color color_from_scatter = attenuation
+                * ray_color(scattered, depth-1, world, light, rec.mat->is_specular());
 
-            // Add direct light + (compensated) indirect
             return color_from_emission + direct_light + rr_factor * color_from_scatter;
         }
 };

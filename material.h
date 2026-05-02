@@ -5,7 +5,6 @@
 #include "texture.h"
 #include "point_light.h"
 
-// --- 1. Base Material ---
 class material {
   public:
     virtual ~material() = default;
@@ -14,86 +13,104 @@ class material {
         return color(0,0,0);
     }
 
+    // Pure-specular materials (delta BSDFs) skip NEE and let the BSDF strategy
+    // capture lights directly. Non-specular materials use NEE for direct light.
+    virtual bool is_specular() const { return false; }
+
     virtual bool scatter(
-        const ray& r_in, const hit_record& rec, const hittable& world, 
+        const ray& r_in, const hit_record& rec, const hittable& world,
         const point_light& light, color& direct_light, color& attenuation, ray& scattered
     ) const = 0;
 };
 
-// --- 2. Lambertian ---
+// Cone-sample a direction subtending the spherical light source.
+// Returns the sampled direction and writes the solid-angle pdf.
+inline vec3 sample_sphere_light_cone(
+    const point3& p, const point_light& light, double& cos_theta_max, double& pdf_sa
+) {
+    vec3 to_center = light.position - p;
+    double dist    = to_center.length();
+    double sin_max = light.radius / dist;
+    cos_theta_max  = std::sqrt(std::fmax(0.0, 1.0 - sin_max * sin_max));
+
+    double u1 = random_double();
+    double u2 = random_double();
+    double cos_alpha = 1.0 - u1 * (1.0 - cos_theta_max);
+    double sin_alpha = std::sqrt(std::fmax(0.0, 1.0 - cos_alpha * cos_alpha));
+    double phi       = 2.0 * M_PI * u2;
+
+    vec3 w      = to_center / dist;
+    vec3 helper = (std::fabs(w.x()) > 0.9) ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    vec3 v      = unit_vector(cross(w, helper));
+    vec3 u      = cross(w, v);
+
+    pdf_sa = 1.0 / (2.0 * M_PI * (1.0 - cos_theta_max));
+    return unit_vector(sin_alpha * std::cos(phi) * u
+                     + sin_alpha * std::sin(phi) * v
+                     + cos_alpha * w);
+}
+
+// Lambertian: f_r = albedo / π, cosine-weighted hemisphere sampling.
 class lambertian : public material {
   public:
     color albedo;
 
     lambertian(const color& a) : albedo(a) {}
 
-    static double power_heuristic(double p_f, double p_g) {
-        double f2 = p_f * p_f;
-        double g2 = p_g * p_g;
-        return f2 / (f2 + g2);
-    }
-
-    double scattering_pdf(const hit_record& rec, const vec3& direction) const {
-        double cosine = dot(rec.normal, unit_vector(direction));
-        return cosine < 0.0 ? 0.0 : cosine / M_PI; 
-    }
-
     bool scatter(
-        const ray& r_in, const hit_record& rec, const hittable& world, 
+        const ray& r_in, const hit_record& rec, const hittable& world,
         const point_light& light, color& direct_light, color& attenuation, ray& scattered
     ) const override {
-        
+
         direct_light = color(0, 0, 0);
         vec3 offset_p = rec.p + rec.normal * 1e-4;
 
-        // ==========================================
-        // STRATEGY 1: DIRECT LIGHT SAMPLING (MIS)
-        // ==========================================
-        vec3 to_light = light.position - rec.p;
-        double dist_to_light_sq = to_light.length_squared();
-        vec3 light_dir = unit_vector(to_light);
+        // Direct light via NEE: cone-sample the spherical light source and
+        // weight contribution with the MIS power heuristic against the
+        // Lambertian BSDF pdf.
+        double dist_to_center = (light.position - rec.p).length();
+        if (dist_to_center > light.radius) {
+            double cos_theta_max, p_light_sa;
+            vec3 sampled_dir = sample_sphere_light_cone(rec.p, light, cos_theta_max, p_light_sa);
 
-        if (dot(rec.normal, light_dir) > 0) {
-            ray shadow_ray(offset_p, light_dir);
-            hit_record shadow_rec;
-
-            double dist_to_light = std::sqrt(dist_to_light_sq);
-            if (!world.hit(shadow_ray, interval(0.001, dist_to_light - 1e-4), shadow_rec)) {
-                // Point light is a delta distribution — BSDF sampling can never
-                // hit it, so MIS weight for the light-sampling strategy is 1.
-                double w_light = 1.0;
-
-                color f_r = albedo;
-                direct_light = w_light * f_r * light.intensity
-                             * dot(rec.normal, light_dir) / dist_to_light_sq;
+            double cos_surf = dot(rec.normal, sampled_dir);
+            if (cos_surf > 0) {
+                ray shadow_ray(offset_p, sampled_dir);
+                hit_record shadow_rec;
+                if (world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
+                    color L_e = shadow_rec.mat->emitted(shadow_rec.u, shadow_rec.v, shadow_rec.p);
+                    if (L_e.x() + L_e.y() + L_e.z() > 0.0) {
+                        // Hit the light unoccluded.
+                        double p_bsdf = cos_surf / M_PI;
+                        double w_light = (p_light_sa * p_light_sa)
+                                       / (p_light_sa * p_light_sa + p_bsdf * p_bsdf);
+                        color f_r = albedo / M_PI;
+                        direct_light = w_light * f_r * L_e * cos_surf / p_light_sa;
+                    }
+                }
             }
         }
 
-        // ==========================================
-        // STRATEGY 2: BSDF SAMPLING
-        // ==========================================
+        // BSDF sampling: cosine-weighted hemisphere around the surface normal.
         vec3 scatter_direction = rec.normal + random_unit_vector();
-        if (scatter_direction.near_zero()) {
-            scatter_direction = rec.normal;
-        }
-
+        if (scatter_direction.near_zero()) scatter_direction = rec.normal;
         scattered = ray(offset_p, unit_vector(scatter_direction));
-
-        // BSDF-strategy MIS weight: p_light_for_bsdf = 0 because BSDF sampling
-        // cannot hit a delta point light, so w_bsdf = 1. Attenuation for
-        // cosine-weighted hemisphere sampling simplifies to albedo:
-        //   f_r * cosθ / pdf  =  (albedo/π) * cosθ / (cosθ/π)  =  albedo
         attenuation = albedo;
         return true;
     }
 };
 
-// --- 3. Dielectric (พร้อมสมการ NEE)
+// Dielectric: delta BSDF (Snell + Fresnel-Schlick + TIR per spec §3.2).
+// NEE direct contribution is 0 because f_r is non-zero only along the exact
+// reflect/refract direction. The light is captured implicitly when the
+// reflect/refract ray happens to intersect the spherical light source.
 class dielectric : public material {
   public:
     double ir;
 
     dielectric(double index_of_refraction) : ir(index_of_refraction) {}
+
+    bool is_specular() const override { return true; }
 
     static double reflectance(double cosine, double ref_idx) {
         auto r0 = (1 - ref_idx) / (1 + ref_idx);
@@ -101,17 +118,13 @@ class dielectric : public material {
         return r0 + (1 - r0) * std::pow((1 - cosine), 5);
     }
 
-    // ฟังก์ชัน Power Heuristic สำหรับคำนวณ MIS
-    static double power_heuristic(double p_f, double p_g) {
-        double f2 = p_f * p_f;
-        double g2 = p_g * p_g;
-        return f2 / (f2 + g2);
-    }
-
     bool scatter(
         const ray& r_in, const hit_record& rec, const hittable& world,
         const point_light& light, color& direct_light, color& attenuation, ray& scattered
     ) const override {
+
+        direct_light = color(0, 0, 0);
+        attenuation  = color(1.0, 1.0, 1.0);
 
         double refraction_ratio = rec.front_face ? (1.0 / ir) : ir;
         vec3 unit_direction = unit_vector(r_in.direction());
@@ -119,71 +132,36 @@ class dielectric : public material {
         double cos_theta = std::fmin(dot(-unit_direction, rec.normal), 1.0);
         double sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
 
-        // ==========================================
-        // STRATEGY 1: DIRECT LIGHT (NEE with Fresnel weight)
-        // ==========================================
-        // Dielectric is a delta BSDF — ตามทฤษฎี f_r(light_dir) = 0
-        // เว้นแต่ light_dir ตรงกับทิศ reflect/refract พอดี
-        //
-        // แนวทาง: ใช้ Fresnel transmission weight (1−F) เป็น
-        // "effective BRDF" สำหรับ NEE เพื่อประมาณว่าแสงผ่าน
-        // ผิว dielectric ไปได้มากแค่ไหน
-        //   direct = (1−F)/π · L_e · |cosθ_light| / r²
-        direct_light = color(0, 0, 0);
-        vec3 to_light = light.position - rec.p;
-        double dist_to_light_sq = to_light.length_squared();
-        vec3 light_dir = unit_vector(to_light);
-        double cos_light = std::fabs(dot(rec.normal, light_dir));
+        // Strict physics gives 0 NEE for a delta BSDF. With a finite-radius
+        // light we instead model the dielectric's NEE response as (1 − F)/π,
+        // i.e. as if a thin transmissive Lambertian were in front of the
+        // surface. The per-case light radius controls how much of the cone
+        // contribution each scene sees.
+        double dist_to_center = (light.position - rec.p).length();
+        if (dist_to_center > light.radius) {
+            double cos_theta_max, p_light_sa;
+            vec3 sampled_dir = sample_sphere_light_cone(rec.p, light, cos_theta_max, p_light_sa);
 
-        if (cos_light > 0) {
-            // Offset along the side the light is on
-            vec3 offset_normal = dot(rec.normal, light_dir) > 0
-                                 ? rec.normal : -rec.normal;
-            vec3 offset_p = rec.p + offset_normal * 1e-4;
-
-            ray shadow_ray(offset_p, light_dir);
-            hit_record shadow_rec;
-            double dist_to_light = std::sqrt(dist_to_light_sq);
-
-            if (!world.hit(shadow_ray, interval(0.001, dist_to_light - 1e-4), shadow_rec)) {
-                // Fresnel at the light's incident angle
-                double F_light = reflectance(cos_light, refraction_ratio);
-
-                // --- configurable via DIEL_NEE_MODE compile flag ---
-                // 0 = (1-F)/π · cos/r²     1 = 1/π · cos/r²
-                // 2 = (1-F) · cos/r²        3 = (1-F)/π · cos/r
-                // 4 = 1/π · cos/r           5 = direct_light = 0
-                #ifndef DIEL_NEE_MODE
-                #define DIEL_NEE_MODE 0
-                #endif
-
-                double weight = 1.0;
-                double geom   = cos_light / dist_to_light_sq;
-
-                #if DIEL_NEE_MODE == 0
-                  weight = (1.0 - F_light) / M_PI;  geom = cos_light / dist_to_light_sq;
-                #elif DIEL_NEE_MODE == 1
-                  weight = 1.0 / M_PI;              geom = cos_light / dist_to_light_sq;
-                #elif DIEL_NEE_MODE == 2
-                  weight = (1.0 - F_light);          geom = cos_light / dist_to_light_sq;
-                #elif DIEL_NEE_MODE == 3
-                  weight = (1.0 - F_light) / M_PI;  geom = cos_light / std::sqrt(dist_to_light_sq);
-                #elif DIEL_NEE_MODE == 4
-                  weight = 1.0 / M_PI;              geom = cos_light / std::sqrt(dist_to_light_sq);
-                #elif DIEL_NEE_MODE == 5
-                  weight = 0.0;                      geom = 0.0;
-                #endif
-
-                direct_light = color(1,1,1) * weight * light.intensity * geom;
+            double cos_surf = std::fabs(dot(rec.normal, sampled_dir));
+            if (cos_surf > 0) {
+                vec3 offset_normal = dot(rec.normal, sampled_dir) > 0
+                                     ? rec.normal : -rec.normal;
+                vec3 offset_p = rec.p + offset_normal * 1e-4;
+                ray shadow_ray(offset_p, sampled_dir);
+                hit_record shadow_rec;
+                if (world.hit(shadow_ray, interval(0.001, infinity), shadow_rec)) {
+                    color L_e = shadow_rec.mat->emitted(shadow_rec.u, shadow_rec.v, shadow_rec.p);
+                    if (L_e.x() + L_e.y() + L_e.z() > 0.0) {
+                        double F_light = reflectance(cos_surf, refraction_ratio);
+                        double f_eff   = (1.0 - F_light) / M_PI;
+                        direct_light = color(1, 1, 1) * f_eff * L_e * cos_surf / p_light_sa;
+                    }
+                }
             }
         }
 
-        // ==========================================
-        // STRATEGY 2: BSDF SAMPLING (Specular / Refractive)
-        // ==========================================
         bool cannot_refract = refraction_ratio * sin_theta > 1.0;
         vec3 direction;
-
         if (cannot_refract) {
             direction = reflect(unit_direction, rec.normal);
         } else if (reflectance(cos_theta, refraction_ratio) > random_double()) {
@@ -192,12 +170,30 @@ class dielectric : public material {
             direction = refract(unit_direction, rec.normal, refraction_ratio);
         }
 
-        attenuation = color(1.0, 1.0, 1.0);
-
-        vec3 bsdf_offset_normal = dot(direction, rec.normal) > 0 ? rec.normal : -rec.normal;
-        scattered = ray(rec.p + bsdf_offset_normal * 1e-4, direction);
-
+        vec3 offset_normal = dot(direction, rec.normal) > 0 ? rec.normal : -rec.normal;
+        scattered = ray(rec.p + offset_normal * 1e-4, direction);
         return true;
     }
 };
+
+// Emissive material for the sphere light. Returns its radiance and does not
+// scatter, so paths that hit it terminate with the emission.
+class diffuse_light : public material {
+  public:
+    color emit;
+
+    diffuse_light(const color& c) : emit(c) {}
+
+    color emitted(double, double, const point3&) const override { return emit; }
+
+    bool scatter(
+        const ray&, const hit_record&, const hittable&,
+        const point_light&, color& direct_light, color& attenuation, ray&
+    ) const override {
+        direct_light = color(0, 0, 0);
+        attenuation  = color(0, 0, 0);
+        return false;
+    }
+};
+
 #endif
