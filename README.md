@@ -58,7 +58,9 @@ cmake -S . -B build
 cmake --build build
 ```
 
-The binary is produced at `build/pathtracer`.
+The binary is produced at `build/pathtracer`. The `build/` directory is
+generated output and is not tracked in git — regenerate it locally with the
+two commands above.
 
 ## Run
 
